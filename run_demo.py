@@ -1,6 +1,5 @@
 from field16 import Field16
-import sys
-import os
+import sys, os
 import numpy as np
 
 print("=== run_demo.py: top-level print ===")
@@ -17,168 +16,280 @@ def derivative_x(arr: np.ndarray, dx: float) -> np.ndarray:
     """
     d = np.zeros_like(arr)
     d[..., 1:-1] = (arr[..., 2:] - arr[..., :-2]) / (2.0 * dx)
-    d[..., 0] = d[..., 1]       # crude boundary: copy neighbour
+    d[..., 0] = d[..., 1]       # simple copy at boundaries
     d[..., -1] = d[..., -2]
     return d
 
 
-def williamson_like_rhs(state: Field16,
-                        dx: float,
-                        c: float = 1.0,
-                        kappa_S: float = 0.1,
-                        kappa_T: float = 0.1) -> Field16:
-    """
-    Prototype RHS:
-      - Maxwell-like evolution for a 1D Ey/Bz pair.
-      - Plus *passive* 'mass' (S) and 'spin' (T) channels driven
-        by EM invariants:
-          S_t ~ (E^2 - B^2)
-          T_x_t ~ (E * B)
-
-    We do *not* feed S/T back into E/B yet – they just integrate
-    whatever the EM field does.
-    """
+def williamson_like_rhs(state: Field16, dx: float, c: float = 1.0) -> Field16:
     rhs = Field16.zeros(state.nx)
 
-    # 1D "photon" sector: Ey ≡ E[1], Bz ≡ B[2]
+    # --- Maxwell sector (Ey,Bz) ---
     Ey = state.E[1]
     Bz = state.B[2]
 
-    # Maxwell subset (c=1 units by default)
     rhs.E[1] = c**2 * derivative_x(Bz, dx)
     rhs.B[2] = derivative_x(Ey, dx)
 
-    # EM invariants in 1D:
-    #   F^2 ~ (E^2 - B^2)
-    #   F⋆F ~ E·B   (here E and B only have Ey,Bz)
-    F_sq = Ey**2 - Bz**2       # breaks null condition
-    EB   = Ey * Bz             # pseudoscalar-like invariant
+    # --- Simple nonlinear couplings into S (pivot) and T (spin) ---
 
-    # Toy "pivot / root-mass" channel:
-    # S_t = κ_S * (E^2 - B^2)
-    rhs.S = kappa_S * F_sq
+    # Poynting-like flow along x in 1D: S_x ∝ E_y * B_z
+    poynting_x = Ey * Bz  # shape (nx,)
 
-    # Toy "spin" channel: spin density along x (T[0])
-    # T_x_t = κ_T * E_y B_z
-    rhs.T[0] = kappa_T * EB
+    # EM invariants (already used in diagnostics):
+    # I1 = B^2 - E^2 (for the E_y, B_z components we’re using)
+    I1 = Bz**2 - Ey**2
+    # I2 = E ⋅ B is zero for pure Ey/Bz, so we skip it here
 
-    # Everything else remains zero (for now)
+    # Coupling strengths (tune these SMALL to avoid instability)
+    g_pivot = 1e-3   # how strongly I1 sources S
+    g_spin  = 1e-3   # how strongly Poynting sources T_x
+
+    # Source “pivot” scalar S where the field departs from null
+    rhs.S += g_pivot * I1
+
+    # Source spin trivector T_x where there is EM momentum flow
+    # In your indexing: T[0] is the "0yz" component (spin around x)
+    rhs.T[0] += g_spin * poynting_x
+
     return rhs
 
 
-def step_euler(state: Field16,
-               dt: float,
-               dx: float,
-               nsteps: int,
-               c: float = 1.0,
-               kappa_S: float = 0.1,
-               kappa_T: float = 0.1) -> Field16:
+
+def step_rk4(state: Field16, dt: float, dx: float, nsteps: int, c: float = 1.0) -> Field16:
     """
-    Explicit Euler time-stepping.
+    4th‑order Runge–Kutta time stepping for the first‑order system
+        ∂_t state = RHS(state).
+
+    This is stable for wave‑like systems where explicit Euler is not.
     """
     for _ in range(nsteps):
-        rhs = williamson_like_rhs(state, dx, c=c,
-                                  kappa_S=kappa_S, kappa_T=kappa_T)
-        state += dt * rhs
+        k1 = williamson_like_rhs(state, dx, c)
+        k2 = williamson_like_rhs(state + 0.5 * dt * k1, dx, c)
+        k3 = williamson_like_rhs(state + 0.5 * dt * k2, dx, c)
+        k4 = williamson_like_rhs(state + dt * k3, dx, c)
+        state += (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
     return state
 
 
-def init_single_photon(state: Field16, x: np.ndarray) -> None:
-    """
-    Old initial condition:
-      - Single Gaussian pulse in Ey with matching Bz.
-    """
-    width = 2.0
-    Ey0 = np.exp(-x**2 / (2 * width**2))
+# ------------------------------------------------------------------
+# Initial conditions
+# ------------------------------------------------------------------
 
+def init_single_photon(state: Field16, x: np.ndarray, width: float = 2.0) -> None:
+    """
+    Simple Gaussian pulse in E_y and matching B_z.
+
+    This is essentially the earlier single‑packet demo.
+    """
+    Ey0 = np.exp(-x**2 / (2.0 * width**2))
     state.E[1] = Ey0
     state.B[2] = Ey0.copy()
 
 
-def init_dual_photon(state: Field16, x: np.ndarray) -> None:
+def init_dual_photon(state: Field16,
+                     x: np.ndarray,
+                     width: float = 1.5,
+                     k0: float = 4.0,
+                     sep: float = 6.0) -> None:
     """
-    Dual-photon initial condition:
-      - Two counter-propagating "photon-like" packets constructed
-        via the F± = E ± B decomposition.
+    Dual‑photon setup: two counter‑propagating wave packets.
 
-    For the 1D Maxwell system:
-      F+ = E + B  travels with v = -c
-      F- = E - B  travels with v = +c
+    Right‑moving packet (centered at -sep/2):
+        E_y = f_R(x)
+        B_z = +f_R(x)
 
-    So we choose F+ as a left-moving packet, F- as a right-moving
-    packet. Then:
-      E = (F+ + F-) / 2
-      B = (F+ - F-) / 2
+    Left‑moving packet (centered at +sep/2):
+        E_y = f_L(x)
+        B_z = -f_L(x)
 
-    This gives one packet moving left, one moving right.
+    At t = 0 we superpose them so that later they collide
+    near x ~ 0.
     """
-    # Separation and width of the packets
-    x0 = 6.0
-    width = 1.0
-    k0 = 6.0  # carrier wavenumber for a bit of internal structure
+    x_left_center = -0.5 * sep
+    x_right_center = +0.5 * sep
 
-    def gaussian_packet(x, x0, w, k):
-        # Gaussian envelope with a short-wavelength carrier
-        return np.exp(-(x - x0)**2 / (2 * w**2)) * np.cos(k * (x - x0))
+    # Local coordinates for each packet
+    xl = x - x_left_center
+    xr = x - x_right_center
 
-    # Left-moving packet (centered at -x0) => F+
-    F_plus = gaussian_packet(x, -x0, width, k0)
+    # Gaussian envelopes with a carrier cos(k0 x)
+    f_left = np.exp(-xl**2 / (2.0 * width**2)) * np.cos(k0 * xl)
+    f_right = np.exp(-xr**2 / (2.0 * width**2)) * np.cos(k0 * xr)
 
-    # Right-moving packet (centered at +x0) => F-
-    F_minus = gaussian_packet(x, +x0, width, k0)
-
-    Ey = 0.5 * (F_plus + F_minus)
-    Bz = 0.5 * (F_plus - F_minus)
+    Ey = f_left + f_right
+    Bz = -f_left + f_right   # ensures opposite propagation directions
 
     state.E[1] = Ey
     state.B[2] = Bz
 
 
+# ------------------------------------------------------------------
+# Diagnostics
+# ------------------------------------------------------------------
+
+def compute_em_energy(state: Field16, x: np.ndarray) -> float:
+    """
+    Compute 1D "total EM energy" by integrating u = (E^2 + B^2)/2.
+
+    Uses all three components of E and B, not just Ey,Bz, so we
+    automatically keep track if we later excite other EM directions.
+    """
+    # Sum over spatial components, shape (nx,)
+    E2 = np.sum(state.E**2, axis=0)
+    B2 = np.sum(state.B**2, axis=0)
+    energy_density = 0.5 * (E2 + B2)
+
+    return float(np.trapz(energy_density, x))
+
+
+def compute_invariants(state: Field16) -> dict:
+    """
+    Compute the two standard Lorentz invariants of the EM field:
+
+        I1 = B^2 - E^2   (∝ F_{μν} F^{μν} / 2)
+        I2 = E·B         (∝ F_{μν} *F^{μν} / 4)
+
+    Here we just look at their max and RMS magnitude over the grid.
+    In the pure-photon case we expect I1 ≈ 0, I2 ≈ 0 (null field).
+    """
+    E2 = np.sum(state.E**2, axis=0)           # shape (nx,)
+    B2 = np.sum(state.B**2, axis=0)
+    I1 = B2 - E2
+
+    # E·B at each grid point
+    I2 = np.sum(state.E * state.B, axis=0)
+
+    def stats(arr: np.ndarray):
+        max_abs = float(np.max(np.abs(arr)))
+        rms = float(np.sqrt(np.mean(arr**2)))
+        return max_abs, rms
+
+    I1_max, I1_rms = stats(I1)
+    I2_max, I2_rms = stats(I2)
+
+    return {
+        "I1_max": I1_max,
+        "I1_rms": I1_rms,
+        "I2_max": I2_max,
+        "I2_rms": I2_rms,
+    }
+
+
+def non_em_norms(state: Field16) -> dict:
+    """
+    Norms of the non‑EM sectors, so we can see when they start to get excited.
+
+    Right now the RHS does not couple into these components, so they
+    will stay numerically at ~0 up to roundoff; later we'll add couplings.
+    """
+    norms = {}
+
+    def l2(arr: np.ndarray) -> float:
+        return float(np.sqrt(np.sum(arr**2)))
+
+    norms["S"] = l2(state.S)
+    norms["Q"] = l2(state.Q)
+    norms["A0"] = l2(state.A0)
+    norms["T0"] = l2(state.T0)
+    norms["A"] = l2(state.A)
+    norms["T"] = l2(state.T)
+
+    return norms
+
+def compute_observables(state, x, c=1.0):
+    """
+    Compute simple 1D 'particle-like' observables from a Field16 snapshot.
+
+    These are very provisional:
+      - energy from E,B
+      - effective mass via E = m c^2
+      - a 1D 'charge-like' integral from dE/dx
+      - a 'spin-like' integral from |T|
+    """
+    dx = x[1] - x[0]
+
+    # EM sector
+    Ey = state.E[1]      # E_y(x)
+    Bz = state.B[2]      # B_z(x)
+
+    # Energy density and total energy
+    energy_density = 0.5 * (Ey**2 + Bz**2)
+    total_energy = np.trapz(energy_density, x)
+
+    # Effective mass from E = m c^2
+    m_eff = total_energy / (c**2)
+
+    # Very crude 1D 'charge density' proxy:
+    # in real 3D Gauss: rho ~ div(E); here we just take d/dx of E_y as a toy.
+    rho_like = np.gradient(Ey, dx)
+    total_charge_like = np.trapz(rho_like, x)
+
+    # 'Spin density' from the magnitude of the spin 3-vector T(x)
+    # T has shape (3, nx)
+    spin_density = np.linalg.norm(state.T, axis=0)
+    total_spin_like = np.trapz(spin_density, x)
+
+    # Optional: center of energy (useful later when we have localized lumps)
+    if total_energy > 0:
+        x_center = np.trapz(x * energy_density, x) / total_energy
+    else:
+        x_center = 0.0
+
+    return {
+        "total_energy": total_energy,
+        "m_eff": m_eff,
+        "total_charge_like": total_charge_like,
+        "total_spin_like": total_spin_like,
+        "x_center": x_center,
+    }
+
+
+# ------------------------------------------------------------------
+# Main
+# ------------------------------------------------------------------
+
 def main():
-    print("Running abs-rel 1D Williamson demo (step 4: dual photons)...")
+    # Choose scenario from command line, e.g.
+    #   python run_demo.py single
+    #   python run_demo.py dual
+    if len(sys.argv) > 1:
+        scenario = sys.argv[1].lower()
+    else:
+        scenario = "dual"   # default
+
+    print(f"Running abs-rel 1D Williamson demo (scenario: {scenario})...")
 
     # 1D grid
     nx = 400
     L = 40.0
-    x = np.linspace(-L / 2, L / 2, nx)
+    x = np.linspace(-L / 2.0, L / 2.0, nx)
     dx = x[1] - x[0]
-
-    # Simulation controls
-    c = 1.0
-    dt = 0.4 * dx / c
-    nsteps = 600
-
-    # Choose scenario from command line:
-    #   python run_demo.py           -> "dual"
-    #   python run_demo.py single    -> "single"
-    #   python run_demo.py dual      -> "dual"
-    scenario = "dual"
-    if len(sys.argv) >= 2:
-        if sys.argv[1].lower().startswith("single"):
-            scenario = "single"
-        elif sys.argv[1].lower().startswith("dual"):
-            scenario = "dual"
 
     # Create empty multivector field
     state = Field16.zeros(nx)
 
-    # Initialise according to scenario
-    if scenario == "single":
-        print("Initial condition: single-photon Gaussian pulse")
+    # Initial condition
+    if scenario.startswith("single"):
+        print("Initial condition: single Gaussian photon-like packet")
         init_single_photon(state, x)
     else:
         print("Initial condition: dual-photon collision (left+right packets)")
         init_dual_photon(state, x)
 
-    # Evolve
-    state = step_euler(state, dt, dx, nsteps, c=c,
-                       kappa_S=0.1, kappa_T=0.1)
+    # Time-stepping parameters
+    c = 1.0
+    # RK4 is much more stable than Euler; CFL-like safety factor
+    dt = 0.25 * dx / c
+    nsteps = 600
 
-    # Diagnostics: EM energy
+    # Evolve
+    state = step_rk4(state, dt, dx, nsteps, c)
+
+    # Basic EM diagnostics
+    total_energy = compute_em_energy(state, x)
     Ey = state.E[1]
     Bz = state.B[2]
-    energy_density = 0.5 * (Ey**2 + Bz**2)
-    total_energy = np.trapz(energy_density, x)
 
     print(f"Grid points: {nx}")
     print(f"Scenario:    {scenario}")
@@ -186,17 +297,34 @@ def main():
     print(f"Approx total EM field energy (1D) ~ {total_energy:.6g}")
     print(f"Max |E_y| = {np.max(np.abs(Ey)):.4g}, Max |B_z| = {np.max(np.abs(Bz)):.4g}")
 
-    # Non-EM sector norms
-    def l2_norm(arr):
-        return np.sqrt(np.sum(arr**2) * dx)
-
+    # Non-EM sectors
+    norms = non_em_norms(state)
     print("\nNon-EM sector norms:")
-    print(f"  ||S (pivot)||      = {l2_norm(state.S):.3e}")
-    print(f"  ||Q (quedgehog)||  = {l2_norm(state.Q):.3e}")
-    print(f"  ||A0 (time)||      = {l2_norm(state.A0):.3e}")
-    print(f"  ||T0 (hedgehog)||  = {l2_norm(state.T0):.3e}")
-    print(f"  ||A (space)||      = {l2_norm(state.A):.3e}")
-    print(f"  ||T (spin)||       = {l2_norm(state.T):.3e}")
+    print(f"  ||S (pivot)||      = {norms['S']:.3e}")
+    print(f"  ||Q (quedgehog)||  = {norms['Q']:.3e}")
+    print(f"  ||A0 (time)||      = {norms['A0']:.3e}")
+    print(f"  ||T0 (hedgehog)||  = {norms['T0']:.3e}")
+    print(f"  ||A (space)||      = {norms['A']:.3e}")
+    print(f"  ||T (spin)||       = {norms['T']:.3e}")
+
+    # EM invariants (null-field check)
+    inv = compute_invariants(state)
+    print("\nEM invariants (null-field diagnostics):")
+    print(f"  I1 = B^2 - E^2:  max |I1| ~ {inv['I1_max']:.3e},  RMS(I1) ~ {inv['I1_rms']:.3e}")
+    print(f"  I2 = E·B:        max |I2| ~ {inv['I2_max']:.3e},  RMS(I2) ~ {inv['I2_rms']:.3e}")
+
+    # --- Existing diagnostics (energy, norms, invariants) stay as-is above ---
+    # ...
+
+    # New: compute simple 'particle-like' observables
+    obs = compute_observables(state, x, c)
+
+    print("\nField-derived observables (1D toy):")
+    print(f"  Total EM energy        ~ {obs['total_energy']:.6g}")
+    print(f"  Effective mass E/c^2   ~ {obs['m_eff']:.6g}")
+    print(f"  'Charge-like' integral ~ {obs['total_charge_like']:.6g}")
+    print(f"  'Spin-like' integral   ~ {obs['total_spin_like']:.6g}")
+    print(f"  Energy centroid x_c    ~ {obs['x_center']:.6g}")
 
 
 if __name__ == "__main__":
